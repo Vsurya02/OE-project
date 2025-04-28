@@ -1,0 +1,172 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import matplotlib.pyplot as plt
+import requests
+from tqdm import tqdm
+
+# Get coordinates from city name
+def get_coordinates(city_name):
+    url = f"https://nominatim.openstreetmap.org/search?format=json&q={city_name}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers)
+    data = response.json()
+    if not data:
+        raise ValueError("City not found!")
+    lat = float(data[0]["lat"])
+    lon = float(data[0]["lon"])
+    return lat, lon
+
+# Fetch weather data from Open-Meteo API
+def fetch_weather_data(lat, lon, start_date, end_date):
+    url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly=temperature_2m,cloud_cover,shortwave_radiation,relative_humidity_2m,wind_speed_10m&timezone=auto"
+    response = requests.get(url)
+    data = response.json()
+    df = pd.DataFrame(data["hourly"])
+    df["time"] = pd.to_datetime(df["time"])
+    return df
+
+# Simulate solar generation
+def simulate_solar_generation(df, panel_capacity=100):
+    efficiency = 0.15
+    area = panel_capacity * 1000 / 200
+    peak_hours = 5 / 24
+    loss_factor = 0.85
+    df["solar_kwh"] = df["shortwave_radiation"] * area * efficiency * peak_hours * loss_factor / 1000
+    return df
+
+# Sequence creation for LSTM
+def create_sequences(X, y, timesteps=24):
+    X_seq, y_seq = [], []
+    for i in range(len(X) - timesteps):
+        X_seq.append(X[i:i+timesteps])
+        y_seq.append(y[i+timesteps])
+    return np.array(X_seq), np.array(y_seq)
+
+# ---- MAIN CODE ----
+city = input("Enter city name: ")
+lat, lon = get_coordinates(city)
+
+# Fetch and prepare training/test data
+train_df = fetch_weather_data(lat, lon, "2016-01-01", "2019-09-30")
+test_df = fetch_weather_data(lat, lon, "2019-10-01", "2023-12-31")
+
+train_df = simulate_solar_generation(train_df)
+test_df = simulate_solar_generation(test_df)
+
+train_df["month"] = pd.to_datetime(train_df["time"]).dt.month
+test_df["month"] = pd.to_datetime(test_df["time"]).dt.month
+train_df.set_index("time", inplace=True)
+test_df.set_index("time", inplace=True)
+
+features = ["temperature_2m", "cloud_cover", "shortwave_radiation", "relative_humidity_2m", "wind_speed_10m", "month"]
+target = "solar_kwh"
+
+X_train = train_df[features].values
+y_train = train_df[target].values
+X_test = test_df[features].values
+y_test = test_df[target].values
+
+scaler_X = MinMaxScaler()
+scaler_y = MinMaxScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1))
+y_test_scaled = scaler_y.transform(y_test.reshape(-1, 1))
+
+X_train_lstm, y_train_lstm = create_sequences(X_train_scaled, y_train_scaled)
+X_test_lstm, y_test_lstm = create_sequences(X_test_scaled, y_test_scaled)
+
+lstm_model = Sequential([
+    LSTM(100, return_sequences=True, input_shape=(24, len(features))),
+    LSTM(50),
+    Dense(10, activation="relu"),
+    Dense(1)
+])
+lstm_model.compile(optimizer="adam", loss="mse")
+lstm_model.fit(X_train_lstm, y_train_lstm, epochs=20, batch_size=64, validation_split=0.2, verbose=1)
+
+lstm_pred_scaled = lstm_model.predict(X_test_lstm)
+lstm_pred = scaler_y.inverse_transform(lstm_pred_scaled)
+
+lstm_mse = mean_squared_error(y_test[24:], lstm_pred)
+lstm_r2 = r2_score(y_test[24:], lstm_pred)
+print(f"LSTM - MSE: {lstm_mse:.4f}, R²: {lstm_r2:.4f}")
+
+rf_model = RandomForestRegressor(n_estimators=200, max_depth=20, random_state=42)
+rf_model.fit(X_train, y_train)
+rf_pred = rf_model.predict(X_test)
+
+rf_mse = mean_squared_error(y_test, rf_pred)
+rf_r2 = r2_score(y_test, rf_pred)
+print(f"Random Forest - MSE: {rf_mse:.4f}, R²: {rf_r2:.4f}")
+
+# Predict future (simulate future weather)
+future_dates = pd.date_range("2024-01-01", "2025-12-31 23:00:00", freq="H")
+future_df = pd.DataFrame(index=future_dates)
+months = future_df.index.month
+base_irradiance = np.where((months >= 6) & (months <= 9), 120, 200)
+future_df["temperature_2m"] = np.random.uniform(20, 35, len(future_dates))
+future_df["cloud_cover"] = np.random.uniform(0, 100, len(future_dates))
+future_df["shortwave_radiation"] = np.clip(base_irradiance + np.random.normal(0, 40, len(future_dates)), 0, 500)
+future_df["relative_humidity_2m"] = np.random.uniform(50, 90, len(future_dates))
+future_df["wind_speed_10m"] = np.random.uniform(5, 20, len(future_dates))
+future_df["month"] = future_df.index.month
+future_df = simulate_solar_generation(future_df)
+
+X_future = future_df[features].values
+X_future_scaled = scaler_X.transform(X_future)
+X_future_lstm, _ = create_sequences(X_future_scaled, np.zeros(len(X_future)))
+
+lstm_future_pred_scaled = lstm_model.predict(X_future_lstm)
+lstm_future_pred = scaler_y.inverse_transform(lstm_future_pred_scaled)
+rf_future_pred = rf_model.predict(X_future)
+
+future_df["lstm_pred"] = np.nan
+future_df["rf_pred"] = rf_future_pred
+future_df.loc[future_df.index[24:], "lstm_pred"] = lstm_future_pred.flatten()
+
+quarterly_lstm = future_df["lstm_pred"].resample("Q").sum()
+quarterly_rf = future_df["rf_pred"].resample("Q").sum()
+
+print(f"\nQuarterly Predictions (LSTM) for 2024-2025 (kWh) in {city}:")
+print(quarterly_lstm)
+print(f"\nQuarterly Predictions (Random Forest) for 2024-2025 (kWh) in {city}:")
+print(quarterly_rf)
+
+# Graphs
+plt.figure(figsize=(12, 6))
+plt.plot(quarterly_lstm, label="LSTM", marker="o")
+plt.plot(quarterly_rf, label="Random Forest", marker="o")
+plt.title(f"Quarterly Solar Energy Predictions (2024-2025) - {city}")
+plt.xlabel("Quarter")
+plt.ylabel("Total Solar Energy (kWh)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Additional: Actual vs Predicted for test period
+plt.figure(figsize=(12, 6))
+plt.plot(test_df.index[24:], y_test[24:], label="Actual", alpha=0.6)
+plt.plot(test_df.index[24:], lstm_pred, label="LSTM Predicted", alpha=0.8)
+plt.title(f"Actual vs LSTM Predicted Solar Generation - {city}")
+plt.xlabel("Date")
+plt.ylabel("Solar Energy (kWh)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12, 6))
+plt.plot(test_df.index, y_test, label="Actual", alpha=0.6)
+plt.plot(test_df.index, rf_pred, label="RF Predicted", alpha=0.8)
+plt.title(f"Actual vs RF Predicted Solar Generation - {city}")
+plt.xlabel("Date")
+plt.ylabel("Solar Energy (kWh)")
+plt.legend()
+plt.tight_layout()
+plt.show()
